@@ -1,7 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Train
-Train your nerual network
-Author: Tawn Kramer
+Train your neural network
+Author: Tawn Kramer (modified for deterministic splits + JSON logging + augmentation split)
 """
 from __future__ import print_function
 import os
@@ -9,100 +11,157 @@ import sys
 import fnmatch
 import argparse
 import random
-from glob import glob
 import json
+from glob import glob
 
 import numpy as np
 from PIL import Image
 from tensorflow import keras
-
 import tensorflow as tf
+
+# ============================================================
+# Global seed for reproducibility
+# ============================================================
+GLOBAL_SEED = 42
+
+def set_global_seed(seed=42):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+set_global_seed(GLOBAL_SEED)
+
+# ============================================================
+# GPU memory growth: evita freeze e frammentazione VRAM
+# ============================================================
+gpus = tf.config.list_physical_devices('GPU')
+for g in gpus:
+    try:
+        tf.config.experimental.set_memory_growth(g, True)
+        print(f"✅ Memory growth attivo su {g.name}")
+    except Exception as e:
+        print(f"⚠️ Impossibile impostare memory growth su {g.name}: {e}")
+
 
 tf.config.optimizer.set_experimental_options({
     'layout_optimizer': False
 })
 
-
-# Add the root directory of your project to sys.path
+# ============================================================
+# Import project modules
+# ============================================================
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
-# Now you can use absolute imports
 import models.conf as conf
 from models.models_small_input import get_nvidia_model
 
-"""
-matplotlib can be a pain to setup. So handle the case where it is absent. When present,
-use it to generate a plot of training results.
-"""
+# ============================================================
+# Matplotlib setup
+# ============================================================
 try:
     import matplotlib
-
-    # Force matplotlib to not use any Xwindows backend.
     matplotlib.use("Agg")
-
     import matplotlib.pyplot as plt
-
     do_plot = True
 except:
     do_plot = False
 
-
-
+# ============================================================
+# Constants
+# ============================================================
 CROP_TOP = 204
 CROP_BOTTOM = 35
 TARGET_H, TARGET_W = 66, 200
 
+# Directory dove trovare i JSON originali (per immagini augmentate)
+JSON_SEARCH_DIRS = [
+    "/media/davidejannussi/New Volume/fortua/dataset_out_front_nominal",
+    "/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery",
+    "/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery_turns",
+]
+
+# ============================================================
+# Utility
+# ============================================================
 def shuffle(samples):
-    """
-    Shuffle a list and return a new shuffled list without modifying the original.
-    """
-    shuffled = samples[:]  # make a copy
+    shuffled = samples[:]
     random.shuffle(shuffled)
     return shuffled
 
-
-
 def load_json(filename):
     with open(filename, "rt") as fp:
-        data = json.load(fp)
-    return data
+        return json.load(fp)
 
+def get_files(filemask):
+    """Recursively find all matching files."""
+    filemask = os.path.expanduser(filemask)
+    path, mask = os.path.split(filemask)
+    matches = []
+    for root, _, filenames in os.walk(path):
+        for filename in fnmatch.filter(filenames, mask):
+            matches.append(os.path.join(root, filename))
+    return matches
 
+def find_json_for_augmented_image(img_name):
+    """
+    Trova il JSON corretto per un'immagine augmentata.
+    Gestisce nomi del tipo 'canny_edges_mapping_2025-10-02-09-10-20_frame_001352.png'
+    """
+    name_noext = os.path.splitext(img_name)[0]
+    parts = name_noext.split("_")
+    try:
+        date_number = parts[-3]
+        frame_number = parts[-1]
+    except IndexError:
+        return None
+
+    json_name = f"record_{date_number}_frame_{frame_number}.json"
+    for root in JSON_SEARCH_DIRS:
+        json_path = os.path.join(root, json_name)
+        if os.path.exists(json_path):
+            return json_path
+    return None
+
+# ============================================================
+# Data generator
+# ============================================================
 def generator(samples, batch_size=32):
     num_samples = len(samples)
-    shown_preview = False  # show only once
-
     while True:
         samples = shuffle(samples)
         for offset in range(0, num_samples, batch_size):
-            batch_samples = samples[offset:offset+batch_size]
-
-            images = []
-            controls = []
+            batch_samples = samples[offset:offset + batch_size]
+            images, controls = [], []
 
             for fullpath in batch_samples:
                 try:
-                    date_number = os.path.basename(fullpath).split("_")[0]
-                    frame_number = os.path.basename(fullpath).split("_")[2].split(".")[0]
-                    json_filename = os.path.join(
-                        os.path.dirname(fullpath),
-                        f"record_{date_number}_frame_{frame_number}.json"
-                    )
+                    fname = os.path.basename(fullpath)
 
-                    if not os.path.exists(json_filename):
+                    # --- cerca JSON ---
+                    if "dataset_aug" in fullpath:
+                        json_filename = find_json_for_augmented_image(fname)
+                    else:
+                        date_number = fname.split("_")[0]
+                        frame_number = fname.split("_")[2].split(".")[0]
+                        json_filename = os.path.join(
+                            os.path.dirname(fullpath),
+                            f"record_{date_number}_frame_{frame_number}.json"
+                        )
+                    if not json_filename or not os.path.exists(json_filename):
                         continue
+
                     data = load_json(json_filename)
                     steering = float(data["user/angle"])
                     throttle = float(data["user/throttle"])
 
-                    # --- Load and crop image using PIL ---
-                    img = Image.open(fullpath)
-                    width, height = img.size
-                    img = img.crop((0, CROP_TOP, width, height - CROP_BOTTOM))  # crop
-                    img = img.resize((TARGET_W, TARGET_H))  # resize
-                    img = np.asarray(img, dtype=np.float32) / 255.0  # normalize
-
+                    with Image.open(fullpath) as im:
+                        im = im.convert("RGB")       # forza sempre 3 canali
+                        width, height = im.size
+                        im = im.crop((0, CROP_TOP, width, height - CROP_BOTTOM))
+                        im = im.resize((TARGET_W, TARGET_H))
+                        img = np.asarray(im, dtype=np.float32)
 
                     images.append(img)
                     if conf.num_outputs == 2:
@@ -110,8 +169,8 @@ def generator(samples, batch_size=32):
                     else:
                         controls.append([steering])
 
-                    # --- Flipped augmentation ---
-                    flipped = np.flip(img, axis=1)
+                    # Flipped version
+                    flipped = np.flip(img, axis=1).copy()
                     images.append(flipped)
                     if conf.num_outputs == 2:
                         controls.append([-steering, throttle])
@@ -119,185 +178,174 @@ def generator(samples, batch_size=32):
                         controls.append([-steering])
 
                 except Exception as e:
-                    print("skipping", fullpath, "due to", e)
+                    print("Skipping", fullpath, "due to", e)
                     continue
 
             if not images:
                 continue
 
-            X_train = np.array(images, dtype=np.float32)
-            y_train = np.array(controls, dtype=np.float32)
-            yield X_train, y_train
+            batch_x = np.array(images, dtype=np.float32)
+            batch_y = np.array(controls, dtype=np.float32)
 
+            # ✅ Rilascio memoria delle liste temporanee
+            del images, controls
+            yield batch_x, batch_y
 
-
-def get_files(filemask):
-    """
-    use a filemask and search a path recursively for matches
-    """
-    # matches = glob.glob(os.path.expanduser(filemask))
-    # return matches
-    filemask = os.path.expanduser(filemask)
-    path, mask = os.path.split(filemask)
-
-    matches = []
-    for root, dirnames, filenames in os.walk(path):
-        for filename in fnmatch.filter(filenames, mask):
-            matches.append(os.path.join(root, filename))
-    return matches
-
-
-def train_test_split(lines, test_perc):
-    """
-    split a list into two parts, percentage of test used to seperate
-    """
-    train = []
-    test = []
-
-    for line in lines:
-        if random.uniform(0.0, 1.0) < test_perc:
-            test.append(line)
+# ============================================================
+# Deterministic split
+# ============================================================
+def train_test_split(lines, test_perc, split_file=None, seed=GLOBAL_SEED):
+    random.seed(seed)
+    if split_file and os.path.exists(split_file):
+        with open(split_file, "r") as f:
+            data = json.load(f)
+        if "seed" in data and data["seed"] == seed:
+            print(f"✅ Using existing split file: {split_file}")
+            return data["train"], data["val"]
         else:
-            train.append(line)
+            print(f"⚠️ Seed changed — regenerating split using seed {seed}")
 
-    return train, test
+    train, val = [], []
+    for line in lines:
+        (val if random.uniform(0, 1) < test_perc else train).append(line)
 
+    if split_file:
+        with open(split_file, "w") as f:
+            json.dump({"train": train, "val": val, "seed": seed}, f, indent=2)
+        print(f"💾 Saved new split (seed {seed}) to {split_file}")
 
-def make_generators(inputs, inputs2=None, limit=None, batch_size=64):
-    """
-    Load the job spec from the csv and create some generator for training.
-    Supports combining two datasets (inputs + inputs2).
-    """
+    return train, val
 
-    # get the image/steering pairs from the first folder
+# ============================================================
+# Generator builder with augment split
+# ============================================================
+def make_generators(inputs, inputs2=None, inputs3=None, augmentation=None, limit=None, batch_size=64):
+    """Build generators, preserving previous split and adding augmentation data separately."""
+    # --- Carica dataset base ---
     lines = get_files(inputs)
-    print("Found %d files in first dataset" % len(lines))
+    print(f"Found {len(lines)} files in first dataset")
 
     if inputs2:
-        lines2 = get_files(inputs2)
-        print("Found %d files in second dataset" % len(lines2))
-        lines.extend(lines2)
+        lines += get_files(inputs2)
+        print(f"Added second dataset: now {len(lines)} files")
 
-    print("Total combined files: %d" % len(lines))
+    if inputs3:
+        lines += get_files(inputs3)
+        print(f"Added third dataset: now {len(lines)} files")
 
-    if limit is not None:
+    if limit:
         lines = lines[:limit]
-        print("Limiting to %d files" % len(lines))
+        print(f"Limiting to {len(lines)} files")
 
-    # now split for validation AFTER combining both datasets
-    train_samples, validation_samples = train_test_split(lines, test_perc=0.2)
+    # --- Split base ---
+    split_file = "dataset_split_combined.json"
+    if os.path.exists(split_file):
+        with open(split_file, "r") as f:
+            base_split = json.load(f)
+        train_samples = base_split["train"]
+        val_samples = base_split["val"]
+        print(f"✅ Loaded base split ({len(train_samples)} train, {len(val_samples)} val)")
+    else:
+        print("⚠️ No base split found — generating new one")
+        train_samples, val_samples = train_test_split(lines, 0.2, split_file, seed=GLOBAL_SEED)
 
-    print("num train/val", len(train_samples), len(validation_samples))
+    # --- Aggiungi dati augmentati ---
+    if augmentation:
+        aug_files = get_files(os.path.join(augmentation, "*.png"))
+        print(f"Found {len(aug_files)} augmented images")
 
-    train_generator = generator(train_samples, batch_size=batch_size)
-    validation_generator = generator(validation_samples, batch_size=batch_size)
+        if aug_files:
+            aug_train, aug_val = train_test_split(aug_files, 0.2, None, seed=GLOBAL_SEED)
+            print(f"Aug split: {len(aug_train)} train, {len(aug_val)} val")
 
-    n_train = len(train_samples) * 2
-    n_val = len(validation_samples) * 2
+            train_samples.extend(aug_train)
+            val_samples.extend(aug_val)
 
-    return train_generator, validation_generator, n_train, n_val
+            # salva nuova combinazione
+            new_split_file = "dataset_split_combined_augmented.json"
+            with open(new_split_file, "w") as f:
+                json.dump({
+                    "train": train_samples,
+                    "val": val_samples,
+                    "seed": GLOBAL_SEED,
+                    "augmented_added": len(aug_files)
+                }, f, indent=2)
+            print(f"💾 Saved augmented split: {new_split_file}")
 
+    print(f"Final train={len(train_samples)}, val={len(val_samples)}")
 
+    return (
+        generator(train_samples, batch_size),
+        generator(val_samples, batch_size),
+        len(train_samples) * 2,
+        len(val_samples) * 2,
+    )
 
-def go(model_name, epochs=50, inputs="./log/*.*", limit=None, resume=False):
-    print("working on model", model_name)
+# ============================================================
+# Training
+# ============================================================
+def go(model_name, epochs=50, inputs="./log/*.*", limit=None, resume=False, augmentation=None):
+    print("Working on model", model_name)
 
-    """
-    modify config.json to select the model to train.
-    """
     if resume and os.path.exists(model_name):
-        print(f"Resuming training from checkpoint: {model_name}")
-        model = keras.models.load_model(model_name, compile=False)
-        # ricompila con lo stesso optimizer e loss
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0001),
-                      loss="mse", metrics=["mae"])
+        print(f"Resuming from checkpoint: {model_name}")
+        model = keras.models.load_model(model_name)
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0001), loss="mse", metrics=["mae"])
     else:
         print("Creating new model...")
         model = get_nvidia_model(conf.num_outputs)
 
-    
-
-    """
-    display layer summary and weights info
-    """
-    # show_model_summary(model)
-
     callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=conf.training_patience, verbose=0
-        ),
-        keras.callbacks.ModelCheckpoint(
-            model_name, monitor="val_loss", save_best_only=True, verbose=0
-        ),
+        keras.callbacks.EarlyStopping(monitor="val_loss", patience=conf.training_patience),
+        keras.callbacks.ModelCheckpoint(model_name, monitor="val_loss", save_best_only=True),
     ]
 
-    batch_size = conf.training_batch_size
-
-    # Train on session images
-    train_generator, validation_generator, n_train, n_val = make_generators(
-        inputs, inputs2=args.inputs2, limit=limit, batch_size=batch_size
+    bs = conf.training_batch_size
+    train_gen, val_gen, n_train, n_val = make_generators(
+        inputs, args.inputs2, args.inputs3, augmentation, limit, bs
     )
+
     if n_train == 0:
-        print("no training data found")
+        print("❌ No training data found")
         return
 
-    steps_per_epoch = n_train // batch_size
-    validation_steps = n_val // batch_size
-
-    print("steps_per_epoch", steps_per_epoch, "validation_steps", validation_steps)
+    print(f"steps_per_epoch={n_train // bs}, validation_steps={n_val // bs}")
 
     history = model.fit(
-        train_generator,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=validation_generator,
-        validation_steps=validation_steps,
+        train_gen,
+        steps_per_epoch=n_train // bs,
+        validation_data=val_gen,
+        validation_steps=n_val // bs,
         epochs=epochs,
         verbose=1,
         callbacks=callbacks,
     )
 
-    try:
-        if do_plot:
-            # summarize history for loss
-            plt.plot(history.history["loss"])
-            plt.plot(history.history["val_loss"])
-            plt.title("model loss")
-            plt.ylabel("loss")
-            plt.xlabel("epoch")
-            plt.legend(["train", "test"], loc="upper left")
-            plt.savefig("loss.png")
-            plt.show()
-    except:
-        print("problems with loss graph")
+    if do_plot:
+        plt.plot(history.history["loss"])
+        plt.plot(history.history["val_loss"])
+        plt.title("Model loss")
+        plt.ylabel("Loss")
+        plt.xlabel("Epoch")
+        plt.legend(["train", "val"], loc="upper left")
+        plt.savefig("loss.png")
+        plt.show()
 
-    print(f"Finished training. Saved model {model_name}")
+    print(f"✅ Finished training. Saved model {model_name}")
 
-
+# ============================================================
+# Entry point
+# ============================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="train script")
-    parser.add_argument("--model",default="./checkpoints/trained_on_real.h5", type=str, help="model name")
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=conf.training_default_epochs,
-        help="number of epochs",
-    )
-    parser.add_argument(
-        "--inputs", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_nominal/*.png", help="input mask to gather images"
-    )
-
-    parser.add_argument(
-        "--inputs2", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery/*.png",
-        help="second input mask to gather images (e.g., recovery dataset)"
-    )
-    parser.add_argument(
-        "--limit", type=int, default=None, help="max number of images to train with"
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="resume training from existing checkpoint if available",
-    )
+    parser = argparse.ArgumentParser(description="Train with deterministic split + optional augmentation")
+    parser.add_argument("--model", default="./checkpoints/trained_on_real.h5", type=str)
+    parser.add_argument("--epochs", type=int, default=conf.training_default_epochs)
+    parser.add_argument("--inputs", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_nominal/*.png")
+    parser.add_argument("--inputs2", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery/*.png")
+    parser.add_argument("--inputs3", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery_turns/*.png")
+    parser.add_argument("--augmentation", default=None, help="augmentation dataset folder")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    go(args.model, epochs=args.epochs, limit=args.limit, inputs=args.inputs, resume=args.resume)
+    go(args.model, epochs=args.epochs, limit=args.limit, inputs=args.inputs, resume=args.resume, augmentation=args.augmentation)
