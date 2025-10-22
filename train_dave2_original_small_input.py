@@ -38,7 +38,7 @@ set_global_seed(GLOBAL_SEED)
 gpus = tf.config.list_physical_devices('GPU')
 for g in gpus:
     try:
-        tf.config.experimental.set_memory_growth(g, True)
+        #tf.config.experimental.set_memory_growth(g, True)
         print(f"✅ Memory growth attivo su {g.name}")
     except Exception as e:
         print(f"⚠️ Impossibile impostare memory growth su {g.name}: {e}")
@@ -77,9 +77,9 @@ TARGET_H, TARGET_W = 66, 200
 
 # Directory dove trovare i JSON originali (per immagini augmentate)
 JSON_SEARCH_DIRS = [
-    "/media/davidejannussi/New Volume/fortua/dataset_out_front_nominal",
-    "/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery",
-    "/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery_turns",
+    "/media/davide/New Volume/fortua/dataset_out_front_nominal",
+    "/media/davide/New Volume/fortua/dataset_out_front_recovery",
+    "/media/davide/New Volume/fortua/dataset_out_front_recovery_turns",
 ]
 
 # ============================================================
@@ -340,9 +340,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train with deterministic split + optional augmentation")
     parser.add_argument("--model", default="./checkpoints/trained_on_real.h5", type=str)
     parser.add_argument("--epochs", type=int, default=conf.training_default_epochs)
-    parser.add_argument("--inputs", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_nominal/*.png")
-    parser.add_argument("--inputs2", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery/*.png")
-    parser.add_argument("--inputs3", default="/media/davidejannussi/New Volume/fortua/dataset_out_front_recovery_turns/*.png")
+    parser.add_argument("--inputs", default="/media/davide/New Volume/fortua/dataset_out_front_nominal/*.png")
+    parser.add_argument("--inputs2", default="/media/davide/New Volume/fortua/dataset_out_front_recovery/*.png")
+    parser.add_argument("--inputs3", default="/media/davide/New Volume/fortua/dataset_out_front_recovery_turns/*.png")
     parser.add_argument("--augmentation", default=None, help="augmentation dataset folder")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
