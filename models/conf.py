@@ -2,7 +2,7 @@ import math
 
 training_patience = 10
 
-training_batch_size = 4
+training_batch_size = 16
 
 training_default_epochs = 2000
 
